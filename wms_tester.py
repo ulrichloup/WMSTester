@@ -3,22 +3,73 @@
 # By Ulrich Loup (2020-05-14)
 import sys
 import argparse
-import requests
+from requests import Response, Session, Request, PreparedRequest
 from random import randint
 from abc import ABC, abstractmethod
 from os import path
-
-#
-# Global definitions
-#
-
-OUTPUT_FORMATS = ["csv", "bboxes"]
-TEST_CLASSES = ["RandomBbox","File"]
-
+from copy import deepcopy
+from time import sleep
 
 #
 # Class definitions
 #
+
+class IOTools:
+    """Collection of input/ouput methods."""
+    progresstotal = 0
+    progresscount = 0
+    outputfile = None
+    CSVseparator = ';'
+
+    def setCSVSeparator(self, CSVseparator):
+        """Set another separator for the CSV output than ";"."""
+        self.CSVseparator = CSVseparator
+
+    def setOutputFile(self, outputfile):
+        """Opens an output file at the given path if the directory exists. The file is then used in the output method as target and the console output is supressed."""
+        if outputfile:
+            outputdir = path.dirname(outputfile)
+            if outputdir.strip() and not path.exists(path.dirname(outputfile)):
+                raise Exception("The output directory " + path.dirname(outputfile) + " does not exist.")
+            else:
+                self.outputfile = open(outputfile, "w+")
+
+    def outputLine(self, text):
+        """Output the given text in one line."""
+        if self.outputfile:
+            self.outputfile.write(text + '\n')
+            self.outputfile.flush()
+        else:
+            print(text)
+    
+    def outputCSVLine(self, blocks):
+        """Output the given list of text blocks in one CSV line."""
+        if not isinstance(blocks, list):
+            raise Exception("The text blocks must be provided as list: " + blocks)
+        csvoutput = ""
+        for b in blocks:
+            csvoutput += b.__str__() + self.CSVseparator
+        self.outputLine(csvoutput[:-(self.CSVseparator.__len__())])
+        
+    def initProgress(self, total):
+        """Initializes the total number of steps for the progress bar."""
+        self.progresstotal = total
+        self.progresscount = 0
+
+    def progress(self, increment = 1, status=''):
+        """Progress bar from https://gist.github.com/vladignatyev/06860ec2040cb497f0f3. Increments the count by increment (default=1)."""
+        bar_len = 60
+        filled_len = int(round(bar_len * self.progresscount / float(self.progresstotal)))
+        percents = round(100.0 * self.progresscount / float(self.progresstotal), 1)
+        bar = '=' * filled_len + '-' * (bar_len - filled_len)
+        sys.stdout.write('[%s] %s%s ...%s\r' % (bar, percents, '%', status))
+        sys.stdout.flush()
+        self.progresscount += increment
+    
+    def close(self):
+        """Closes all files and streams of this IOTools object."""
+        if(self.outputfile): self.outputfile.close()
+
 
 class Box:
     """Represents a two-dimensional box."""
@@ -35,14 +86,14 @@ class Box:
         self.uppery = uppery
     
     def __str__(self):
-        """Outputs a string representation of the box."""
+        """Returns a string representation of the box."""
         return self.lowerx.__str__() + "," + self.lowery.__str__() + "," + self.upperx.__str__() + "," + self.uppery.__str__()
         
     def contains(self, box):
         """Returns True if and only if the given box is within the borders of this box."""
         return box.lowerx >= self.lowerx and box.lowery >= self.lowery and box.upperx <= self.upperx and box.uppery <= self.uppery
 
-    def shuffle(self, minwidth=1.0, minheight= 1.0, maxfractionaldigits=0):
+    def generateRandomSubbox(self, minwidth=1.0, minheight= 1.0, maxfractionaldigits=0):
         """Returns a new random box inside this box. Optinally, minwidth (default: 1.0), minheight (default: 1.0), maxfractionaldigits (default: 0) can be given."""
         digitsx = randint(0, maxfractionaldigits)
         if digitsx:
@@ -71,6 +122,23 @@ class Box:
             randheight = randint(minheight, self.uppery - randy)
         return Box(randx, randy, randx+randwidth, randy+randheight)
 
+    def shiftX(self, step):
+        """Shifts the box by step on the x axis."""
+        self.lowerx = self.lowerx + step
+        self.upperx = self.upperx + step
+
+    def shiftY(self, step):
+        """Shifts the box by step on the y axis."""
+        self.lowery = self.lowery + step
+        self.uppery = self.uppery + step
+    
+    def zoom(self, step):
+        """Zooms this box by the given step starting from the center point, i.e., the width and the height of the box are expanded or shrinked by step into each direction."""
+        self.lowerx -= step
+        self.lowery -= step
+        self.upperx += step
+        self.uppery += step
+        
 
 class WMSServer:
     """Represents a web map service (WMS) server and provides methods to connect to it."""
@@ -101,198 +169,263 @@ class WMSServer:
 
 class WMSTestResult:
     """Stores the result data of a WMSTest."""
-    responses = []
-    bboxes = []
+    request = None
+    """The prepared request object."""
+    response = None
+    """The response object."""
     
-    def __init__(self, responses, bboxes):
-        """Initializes a WMSTestResult with a list of response objects and bounding boxes."""
-        if not isinstance(responses, list) and [isinstance(r, requests.Response) for r in responses] == [True for r in responses]:
-            raise Exception("The parameter responses must be a list of requests.Response objects.")
-        self.responses = responses
-        if not isinstance(bboxes, list) and [isinstance(b, Box) for b in bboxes] == [True for b in bboxes]:
-            raise Exception("The parameter responses must be a list of Box objects.")
-        self.bboxes = bboxes
+    def __init__(self, request, response=None):
+        """Initializes a WMSTestResult with a request object and optinally with a response object."""
+        if not isinstance(request, PreparedRequest):
+            raise Exception("The parameter request must be a requests.Request object.")
+        self.request = request
+        if response and not isinstance(response, Response):
+            raise Exception("The parameter response must be a requests.Response object.")
+        self.response = response
     
     def getCSV(self):
         """Generates a CSV representation of the test result."""
         # if r.headers["Content-Type"] != "image/png":
         # raise Exception("Unexpected response format", r.text)
-        return self.response.url + ";" + str(self.response.status_code) + ";" + self.response.headers["Content-Type"] + ";" + str(self.response.elapsed.total_seconds())
-
+        if self.response:
+            return self.request.url + ";" + str(self.response.status_code) + ";" + self.response.headers["Content-Type"] + ";" + str(self.response.elapsed.total_seconds())
+        return self.request.url
+        
+    def close(self):
+        """Closes the response."""
+        self.response.close()
+        
 
 class WMSTest(ABC):
     """A WMS test fixes the basic parameters for a call to a WMS: WMSServer, request, version. Aditional parameters can be added."""
-    server = ""
-    result = ""
-    parameters = {}
-    id = ""
+    server = None
+    layers = ""
+    width = 0
+    height = 0
+    boundingbox = Box(-180.0, -90.0, 180.0, 90.0)
+    basicparameters = {}
+    result = None
+    id = "WMSTest"
     """a short string uniquely identifying the test"""
     spatialextent = Box(-180.0, -90.0, 180.0, 90.0)
     
-    def __init__(self, id, server, layers, width, height):
+    def __init__(self, server, layers, width, height):
         """Initializes a WMS test with the given id and WMSServer server. Aditionally, the srs="EPSG:4326", format="image/png", bbox=-180,-90,180,90 is set."""
-        self.id = id
         if not isinstance(server, WMSServer):
             raise Exception("The server must be an object of WMSServer.")
         self.server = server
-        self.parameters["service"] = "WMS"
-        self.parameters["version"] = "1.1.0"
-        self.parameters["request"] = "GetMap"
-        self.parameters["layers"] = layers
-        self.parameters["width"] = width
-        self.parameters["height"] = height
+        self.results = []
+        self.basicparameters["service"] = "WMS"
+        self.basicparameters["version"] = "1.1.0"
+        self.basicparameters["request"] = "GetMap"
         self.setSRS("EPSG:4326")
         self.setFormat("image/png")
-        self.setBoundingBox(Box(-180.0, -90.0, 180.0, 90.0))
+        self.layers = layers
+        self.width = width
+        self.height = height
+
+    def clone(self):
+        """Returns a copy of this class object while setting the given parameters differently."""
+        return deepcopy(self)
+
+    def setBasicParameter(self, key, value):
+        """Set a basic parameter of the WMS test, which is shared between all copys of this WMS test. The parameter is added if it does not exist. The parameter will be used in every request."""
+        self.basicparameters[key] = value
+        return self
     
-    def addParameter(self, key, value):
-        """Add another basic parameter to the EMS test. The parameter will be used in every request."""
-        self.parameters[key] = value
-    
+    def setLayers(self, layers):
+        """Define the parameter layers. This parameter will be added to any request of this test."""
+        self.layers = layers
+        return self
+        
+    def setWidth(self, width):
+        """Define the parameter width. This parameter will be added to any request of this test."""
+        self.width = width
+        return self
+        
+    def setHeight(self, height):
+        """Define the parameter height. This parameter will be added to any request of this test."""
+        self.height = height
+        return self
+        
     def setBoundingBox(self, box):
         """Re-defines the bounding box parameter by the given box."""
         if not isinstance(box, Box):
             raise Exception("The given box must be of type Box: " + box)
-        self.parameters["bbox"] = box.__str__()
+        if not self.spatialextent.contains(box):
+            raise Exception("The given box must be inside the spatial extent " + self.spatialextent + ".")
+        self.boundingbox = box
+        return self
 
     def setSpatialExtent(self, box):
         """Sets the bounding box in which the testing boxes are generated by the given box."""
         if not isinstance(box, Box):
             raise Exception("The given box must be of type Box: " + box)
         self.spatialextent = box
+        return self
 
     def setSRS(self, srs):
         """Sets the srs (spatial reference system) parameter. Default is "EPSG:4326"."""
-        self.parameters["srs"] = srs
+        self.basicparameters["srs"] = srs
+        return self
 
     def setFormat(self, requestformat):
         """Sets the format parameter. Default is "image/png"."""
-        self.parameters["format"] = requestformat
+        self.basicparameters["format"] = requestformat
+        return self
 
-    def request(self, params = {}):
+    def createRequest(self, params = {}):
         """Sends a request to the WMS server using the basic and optinally the given parameters in params."""
-        params.update(self.parameters)
-        try:
-            r = requests.get(self.server, params)
-            return r
-        except Exception as e:
-            print("Error while sending http request: {0}".format(e))
-
-    @abstractmethod
-    def execute(self, dry = False):
-        """This method executes the test and stores its WMSTestResult which is available by the method getResult. If the optional parameter dry is True, the test does not send requests."""
-        pass
+        params.update(self.basicparameters)
+        params["layers"] = self.layers
+        params["width"] = self.width
+        params["height"] = self.height
+        params["bbox"] = self.boundingbox.__str__()
+        return Request('GET', self.server, params=params).prepare()
+        
+    def execute(self, dry = False, verbosity=0, s=None):
+        """This method executes the test and stores its WMSTestResult object which is available by the method getResult. If the optional second parameter dry is True, the test does not send requests. Additionally, the third parameter verbosity can be set to a non-negative integer representing the verbosity level (default: 0). The fourth parameter s can be used to provide a Session for re-use. Otherwise each request opens and closes its own session."""
+        r = self.createRequest()
+        if dry:
+            self.result = WMSTestResult(r)
+        else:
+            if s:
+                try:
+                    self.result = WMSTestResult(r, s.send(r, verify=False))
+                except Exception as e:
+                    if e.__str__().__contains__("busy"):
+                        if verbosity: print("Pausing the request sending for 5 sec due to a connection overflow.")
+                        sleep(5)
+                        self.result = WMSTestResult(r, s.send(r, verify=False))
+                    else:
+                        raise Exception("Error while sending http request: {0}".format(e))
+            else:
+                s = Session()
+                try:
+                    self.result = WMSTestResult(r, s.send(r, verify=False))
+                    s.close()
+                except Exception as e:
+                    if e.__str__().__contains__("busy"):
+                        if verbosity: print("Pausing the request sending for 5 sec due to a connection overflow.")
+                        sleep(5)
+                        self.result = WMSTestResult(r, s.send(r, verify=False))
+                    else:
+                        raise Exception("Error while sending http request: {0}".format(e))
     
     def getResult(self):
         """Returns the test result of the last test execution."""
         return self.result
-    
-    # def getBox(self):
-        # """Returns the current bounding box of the test."""
-        # return self.parameters["bbox"]
-    
+
+    def getCSV(self):
+        """Generates a CSV representation of the test result."""
+        return self.basicparameters["bbox"]
+
     def __str__(self):
         """Generates a string representation of the WMSTest."""
-        return self.server.__str__() + " " + self.parameters.__str__()
+        return self.server.__str__() + " " + self.basicparameters.__str__()
 
 
 class RandomBoundingBoxWMSTest(WMSTest):
     """Generates a box inside the given bounding box with a random lower left corner and random width and heigth."""
+    id = "RandomBbox"
     minwidth = 1.0
     minheight = 1.0
     maxfractionaldigits = 3
     # Internally, a point is represented as a pair of doubles and a box as pair of the lower left and the upper right points.
-    box = Box()
+
+    def __init__(self, server, layers, width, height):
+        """Initiates a RandomBoundingBoxWMSTest by generating a random bounding box."""
+        super(RandomBoundingBoxWMSTest, self).__init__(server, layers, width, height)
+        self.generateRandomBoundingBox()
     
-    def __init__(self, server, layers, width, height, **kwargs):
-        """Initiates a RandomBoundingBoxWMSTest with the given minimal witdth and height (defaults: 1.0). The default bounding box is [[-180.0, -90.0], [[180.0, 90.0]]. Optionally, the parameters minwidth, minheight, box and maxfractionaldigits can be altered."""
-        super(RandomBoundingBoxWMSTest, self).__init__("RandomBbox", server, layers, width, height)
-        if kwargs.__contains__("minwidth"):
-            self.minwidth = kwargs["minwidth"]
-        if kwargs.__contains__("minheight"):
-            self.minheight = kwargs["minheight"]
-        if kwargs.__contains__("maxfractionaldigits"):
-            self.maxfractionaldigits = kwargs["maxfractionaldigits"]
-        if kwargs.__contains__("box"):
-            box = kwargs["box"]
-            if not isinstance(box, Box):
-                    raise Exception("The box parameter must be of type Box: " + box)
-            if not super().spatialextent.contains(box):
-                raise Exception("The box must be inside the spatial extent " + super().spatialextent + ".")
-            self.box = box
-        else:
-            self.box = super().spatialextent.shuffle(self.minwidth, self.minheight, self.maxfractionaldigits)
-        
     def setMaxFractionalDigits(self, maxfractionaldigits):
         """Sets the maximum number of fractional digits in any random number generated."""
         self.maxfractionaldigits = maxfractionaldigits
-
-    def execute(self, dry = False):
-        """This method executes the test once."""
-        super().setBoundingBox(self.box)
-        self.result = WMSTestResult([], [self.box]) if dry else WMSTestResult([super().request()], [self.box])
-
-
-# # class WalkingBoxWMSTest(WMSTest):
-    # # """Moves a given box by a random step width on the x and on the y axis."""
-    # # minstepwidth = 1.0
-    # # maxstepwidth = 10.0
-    # # maxfractionaldigits = 0
-    # # # Internally, a point is represented as a pair of doubles and a box as pair of the lower left and the upper right points.
-    # # box = []
+        return self
     
-    # # def __init__(self, server, layers, width, height, **kwargs):
-        # # """Initiates a RandomBoundingBoxWMSTest with the given minimal witdth and height (defaults: 1.0). The default bounding box is [[-180.0, -90.0], [[180.0, 90.0]]. Optionally, the parameters minstepwidth, maxstepwidth, box and maxfractionaldigits can be altered."""
-        # # super(WalkingBoxWMSTest, self).__init__("WalkingBbox", server, layers, width, height)
-        # # if kwargs.__contains__("minstepwidth"):
-            # # self.minstepwidth = kwargs["minstepwidth"]
-        # # if kwargs.__contains__("maxstepwidth"):
-            # # self.maxstepwidth = kwargs["maxstepwidth"]
-        # # if kwargs.__contains__("maxfractionaldigits"):
-            # # self.maxfractionaldigits = kwargs["maxfractionaldigits"]
-        # # if kwargs.__contains__("box"):
-            # # box = kwargs["box"]
-            # # if not isinstance(box, list) or not isinstance(box[0], list) or box[0].__len__() != 2 or not isinstance(box[1], list) or box[1].__len__() != 2:
-                    # # raise Exception("The box must be a list of two pairs.")
-            # # if box[0][0] < super().spatialextent[0][0] or box[1][0] > super().spatialextent[1][0] or box[0][1] < super().spatialextent[0][1] or box[1][1] > super().spatialextent[1][1]:
-                # # raise Exception("The box must be inside the spatial extent " + super().spatialextent + ".")
-            # # self.box = box
-
-# # class ZoomingBoxWMSTest(WMSTest):
-    # # """Generates a box inside the given bounding box with a random lower left corner and random width and heigth."""
-    # # minwidth = 1.0
-    # # minheight = 1.0
-    # # maxfractionaldigits = 0
-    # # # Internally, a point is represented as a pair of doubles and a box as pair of the lower left and the upper right points.
-    # # box = []
+    def setMinwidth(self, minwidth):
+        """Sets the minimum width of the random box."""
+        self.minwidth = minwidth
+        return self
     
-    # # def __init__(self, server, layers, width, height, **kwargs):
-        # # """Initiates a RandomBoundingBoxWMSTest with the given minimal witdth and height (defaults: 1.0). The default bounding box is [[-180.0, -90.0], [[180.0, 90.0]]."""
-        # # super(RandomBoundingBoxWMSTest, self).__init__("RandomBbox", server, layers, width, height)
-        # # if kwargs.__contains__("minwidth"):
+    def setMinheight(self, minheight):
+        """Sets the minum height of the random box."""
+        self.minheight = minheight
+        return self
 
+    def generateRandomBoundingBox(self):
+        """(Re-)generates a random box inside the spatial extent."""
+        self.setBoundingBox(super().spatialextent.generateRandomSubbox(self.minwidth, self.minheight, self.maxfractionaldigits))
+        
+        
+class WalkingBoundingBoxWMSTest(RandomBoundingBoxWMSTest):
+    """Moves a given box by a random step width on the x and on the y axis."""
+    id = "WalkingBbox"
+    minstepwidth = 1.0
+    maxstepwidth = 12.0
+    
+    def __init__(self, server, layers, width, height):
+        """Initiates a WalkingBoundingBoxWMSTest by generating a random bounding box."""
+        super(WalkingBoundingBoxWMSTest, self).__init__(server, layers, width, height)
+    
+    def moveBoundingBox(self, xstep = 0, ystep = 0):
+        """Moves the bounding box by one step on the x and on the y axis. If the parameters xstep and ystep are not given, the steps are randomly chosen between minstepwidth and maxstepwidth."""
+        direction = randint(0, 1)
+        if xstep == 0:
+            maxx = int((self.spatialextent.upperx - self.boundingbox.upperx) if direction else self.boundingbox.lowerx - self.spatialextent.lowerx)
+            xstep = randint(min(self.minstepwidth, maxx), min(self.maxstepwidth, maxx))
+            xstep = xstep if direction else -xstep
+            self.boundingbox.shiftX(xstep)
+        else:
+            self.boundingbox.shiftX(xstep)
+            if not self.spatialextent.contains(self.boundingbox):
+                self.boundingbox.shiftX(-xstep)
+                raise Exception("The given x step moves the box out of the spatial extent: " + xstep)
+        direction = randint(0, 1)
+        if ystep == 0:
+            maxy = int((self.spatialextent.uppery - self.boundingbox.uppery) if direction else self.boundingbox.lowery - self.spatialextent.lowery)
+            ystep = randint(min(self.minstepwidth, maxy), min(self.maxstepwidth, maxy))
+            ystep = ystep if direction else -ystep
+            self.boundingbox.shiftY(ystep)
+        else:
+            self.boundingbox.shiftY(ystep)
+            if not self.spatialextent.contains(self.boundingbox):
+                self.boundingbox.shiftY(-ystep)
+                raise Exception("The given y step moves the box out of the spatial extent: " + ystep)
+        return self
+
+
+class ZoomingBoxWMSTest(RandomBoundingBoxWMSTest):
+    """Moves a given box by a random step width on the x and on the y axis."""
+    id = "ZoomingBbox"
+    minboxwidth = 5.0
+    maxboxwidth = 180.0
+    
+    def __init__(self, server, layers, width, height):
+        """Initiates a ZoomingBoxWMSTest by generating a random bounding box."""
+        super(ZoomingBoxWMSTest, self).__init__(server, layers, width, height)
+    
+    def zoomBoundingBox(self, step = 0):
+        """Zooms the bounding box by one step starting from the center. If the parameter step is not given, the step is randomly chosen such that the zoomed box has a width between minboxwidth and the maximum box width."""
+        if step == 0:
+            maxstep = int(min( self.maxboxwidth, (self.spatialextent.upperx - self.boundingbox.upperx), (self.spatialextent.uppery - self.boundingbox.uppery), (self.boundingbox.lowerx - self.spatialextent.lowerx), (self.boundingbox.lowery - self.spatialextent.lowery) ))
+            step = randint(min(self.minboxwidth, maxstep), max(self.minboxwidth, maxstep))
+            self.boundingbox.zoom(step)
+        else:
+            self.boundingbox.zoom(step)
+            if not self.spatialextent.contains(self.boundingbox):
+                self.boundingbox.zoom(-step)
+                raise Exception("The given step zooms the box out of the spatial extent: " + step)
+        return self
+        
 
 #
-# Functions
+# Global definitions
 #
 
-def output(f, text):
-    """Output the given text. If the file f is given, write the text as new line into f. Otherwise print the text to the console."""
-    if f:
-        f.write(text + '\n')
-        f.flush()
-    else:
-        print(text)
-
-def progress(count, total, status=''):
-    """Progress bar from https://gist.github.com/vladignatyev/06860ec2040cb497f0f3. Returns the count incremented by 1."""
-    bar_len = 60
-    filled_len = int(round(bar_len * count / float(total)))
-    percents = round(100.0 * count / float(total), 1)
-    bar = '=' * filled_len + '-' * (bar_len - filled_len)
-    sys.stdout.write('[%s] %s%s ...%s\r' % (bar, percents, '%', status))
-    sys.stdout.flush()
-    return count + 1
+OUTPUT_FORMATS = ["csv", "bboxes"]
+MAX_CONNECTIONS = 256
+TEST_CLASSES = [RandomBoundingBoxWMSTest.id, WalkingBoundingBoxWMSTest.id, ZoomingBoxWMSTest.id]  #["File"]
 
 
 #
@@ -306,7 +439,7 @@ def main():
     parser.add_argument("--host", default="localhost", help="host name of the WMS server")
     parser.add_argument("--port", type=int, default=7600, help="port of the WMS server")
     parser.add_argument("--path", default="/wms", help="service path of the WMS")
-    parser.add_argument("--output-format", dest="outputformat", default=OUTPUT_FORMATS[0], choices=OUTPUT_FORMATS, help="format of the test result")
+    parser.add_argument("--output-format", dest="outputformat", choices=OUTPUT_FORMATS, help="format of the test result")
     parser.add_argument("--output-file", dest="outputfile", help="path to a file where the output is stored (if given, the console output is supressed")
     # parser.add_argument("--input-file", dest="inputfile", help="path to a file containing one box defined by [[lower_x,lower_y],[upper_x,upper_y]] per line")
     parser.add_argument("--width", type=int, required=True, help="width of the requested maps")
@@ -316,14 +449,11 @@ def main():
     parser.add_argument("--tests", nargs='+', default=TEST_CLASSES[0], choices=TEST_CLASSES)
     parser.add_argument("--count", type=int, default=1, help="positive number of test repetitions")
 
+    iot = IOTools()
+    
     args = parser.parse_args()
     # print(args)
-    outputfile = args.outputfile
-    if outputfile:
-        if not path.exists(path.dirname(outputfile)):
-            raise Exception("The output directory " + path.dirname(outputfile) + " does not exist.")
-        else:
-            outputfile = open(outputfile, "w+")
+    iot.setOutputFile(args.outputfile)
     width = args.width
     height = args.height
     verbosity = args.verbose
@@ -331,49 +461,67 @@ def main():
     testclasses = args.tests
     count = args.count if args.count > 0 else 1
 
-    if(verbosity): print("Initizing tests... ", end = '')
+    if verbosity: print("Initizing tests... ", end = '')
     wmsserver = WMSServer(args.host, args.port, args.path)
-    tests = [[[] for t in testclasses] for c in range(count)]
-    for c in range(count):
-        for i in range(testclasses.__len__()):
-            t = testclasses[i]
-            if t == TEST_CLASSES[0]:
-                tests[c][i] = [RandomBoundingBoxWMSTest(wmsserver, layers[0], width, height)]
-                tests[c][i] += [RandomBoundingBoxWMSTest(wmsserver, l, width, height, box=tests[c][i][0].box) for l in layers[1:]]
-    if(verbosity): print("done.")
+    tests = [[[] for l in layers] for t in testclasses]
+    for i in range(testclasses.__len__()):
+        t = testclasses[i]
+        print(t + " ", end = '')
+        if t == RandomBoundingBoxWMSTest.id:
+            # first layer determines the box
+            tests[i][0] = [RandomBoundingBoxWMSTest(wmsserver, layers[0], width, height) for c in range(count)]
+            for j in range(1, layers.__len__()):
+                tests[i][j] = [tests[i][0][c].clone().setLayers(layers[j]) for c in range(count)]
+        if t == WalkingBoundingBoxWMSTest.id:
+            # first layer determines the box
+            # first box starts the walk
+            tests[i][0] = [WalkingBoundingBoxWMSTest(wmsserver, layers[0], width, height)]
+            for c in range(0, count-1):
+                tests[i][0] += [tests[i][0][c].clone().moveBoundingBox()]
+            for j in range(1, layers.__len__()):
+                tests[i][j] = [tests[i][0][c].clone().setLayers(layers[j]) for c in range(count)]
+        if t == ZoomingBoxWMSTest.id:
+            # first layer determines the box
+            # first box starts the zooming
+            tests[i][0] = [ZoomingBoxWMSTest(wmsserver, layers[0], width, height)]
+            for c in range(0, count-1):
+                tests[i][0] += [tests[i][0][c].clone().zoomBoundingBox()]
+            for j in range(1, layers.__len__()):
+                tests[i][j] = [tests[i][0][c].clone().setLayers(layers[j]) for c in range(count)]
+    if verbosity: print("done.")
     if(verbosity == 2): print(tests)
 
-    if(verbosity): print("Testing... ")
-    if args.dry == False:
-        if(verbosity):
-            progressbarMax = count*testclasses.__len__()*layers.__len__()
-            progressbarCount = 0
-            progressbarCount = progress(progressbarCount, progressbarMax)
-        for c in range(count):
-                for i in range(testclasses.__len__()):
-                    for t in tests[c][i]:
-                        t.execute()
-                        if args.outputformat == "csv":
-                            output(outputfile, t.getResult().getCSV())
-                        else:
-                            output(outputfile, t.getResult().getCSV())
-                        if verbosity: progressbarCount = progress(progressbarCount, progressbarMax)
-        if verbosity: print()
-    else:
-        if(verbosity): print("(Request sending skipped.)")
-        if args.outputformat == "csv":
-            for c in range(count):
-                for i in range(testclasses.__len__()):
-                    for t in tests[c][i]:
-                        output(outputfile, t.__str__())
-        elif args.outputformat == "bboxes":
-            for c in range(count):
-                for i in range(testclasses.__len__()):
-                    output(outputfile, tests[c][i]   [0].box.__str__().replace(" ", ""))
-    if outputfile:
-        outputfile.close()
-    if(verbosity): print("done.")
-    
+    if verbosity:
+        print("Testing... ")
+        if not args.dry:
+            iot.initProgress(count*testclasses.__len__()*layers.__len__())
+            iot.progress()
+    connectioncount = 0
+    session = Session()
+    for i in range(tests.__len__()):
+        for j in range(tests[i].__len__()):
+            if args.outputformat == "bboxes":
+                iot.outputLine(tests[i][j][0].boundingbox.__str__())
+            else:
+                for t in tests[i][j]:
+                    t.execute(args.dry, verbosity, session)
+                    connectioncount += 1
+                    if connectioncount == MAX_CONNECTIONS:
+                        if verbosity:
+                            print()
+                            print("Reached " + str(connectioncount) + " connections. Renewing TCP connection.")
+                        session.close()
+                        session = Session()
+                        connectioncount = 0
+                    if args.outputformat == "csv":
+                        iot.outputCSVLine([t.id, t.layers, t.getResult().getCSV()])
+                    else:
+                        iot.outputLine(t.id + "(" + t.layers + " + " + t.boundingbox.__str__() + ")" + ("" if args.dry else ": " + str(t.getResult().response.elapsed.total_seconds()) + " sec"))
+                    t.getResult().close()
+                    if verbosity and not args.dry: iot.progress()
+    if verbosity and not args.dry: print()
+    iot.close()
+    if verbosity: print("done.")
     
 if __name__ == '__main__':
     main()
