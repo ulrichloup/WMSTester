@@ -8,7 +8,12 @@ from random import randint
 from abc import ABC, abstractmethod
 from os import path
 from copy import deepcopy
-from time import sleep
+from time import sleep, time
+from threading import active_count, Thread, Semaphore
+try:
+   from queue import SimpleQueue
+except ImportError:
+   from Queue import SimpleQueue
 
 #
 # Class definitions
@@ -41,6 +46,14 @@ class IOTools:
             self.outputfile.flush()
         else:
             print(text)
+    
+    def outputTest(self, test, outputformat):
+        """Output the given test with the given outputformat being one of OUTPUT_FORMATS."""
+        if outputformat == "csv":
+            self.outputCSVLine([test.id, test.layers, test.result.getCSV()])
+        else:
+            self.outputLine(test.id + "(" + test.layers + " + " + test.boundingbox.__str__() + ")" + (": " + str(test.result.response.elapsed.total_seconds()) + " sec" if test.result else ""))
+        test.result.close()
     
     def outputCSVLine(self, blocks):
         """Output the given list of text blocks in one CSV line."""
@@ -212,9 +225,9 @@ class WMSTest(ABC):
     def __init__(self, server, layers, width, height):
         """Initializes a WMS test with the given id and WMSServer server. Aditionally, the srs="EPSG:4326", format="image/png", bbox=-180,-90,180,90 is set."""
         if not isinstance(server, WMSServer):
-            raise Exception("The server must be an object of WMSServer.")
+            raise Exception("The server must be an instance of WMSServer.")
         self.server = server
-        self.results = []
+        self.result = None
         self.basicparameters["service"] = "WMS"
         self.basicparameters["version"] = "1.1.0"
         self.basicparameters["request"] = "GetMap"
@@ -283,38 +296,26 @@ class WMSTest(ABC):
         params["bbox"] = self.boundingbox.__str__()
         return Request('GET', self.server, params=params).prepare()
         
-    def execute(self, dry = False, verbosity=0, s=None):
-        """This method executes the test and stores its WMSTestResult object which is available by the method getResult. If the optional second parameter dry is True, the test does not send requests. Additionally, the third parameter verbosity can be set to a non-negative integer representing the verbosity level (default: 0). The fourth parameter s can be used to provide a Session for re-use. Otherwise each request opens and closes its own session."""
+    def execute(self, dry = False, verbosity=0, session=None):
+        """This method executes the test and stores its WMSTestResult object which is available by the property result. If the optional second parameter dry is True, the test does not send requests. Additionally, the third parameter verbosity can be set to a non-negative integer representing the verbosity level (default: 0). The fourth parameter s can be used to provide a Session for re-use. Otherwise each request opens and closes its own session."""
         r = self.createRequest()
         if dry:
             self.result = WMSTestResult(r)
         else:
-            if s:
-                try:
-                    self.result = WMSTestResult(r, s.send(r, verify=False))
-                except Exception as e:
-                    if e.__str__().__contains__("busy"):
-                        if verbosity: print("Pausing the request sending for 5 sec due to a connection overflow.")
-                        sleep(5)
-                        self.result = WMSTestResult(r, s.send(r, verify=False))
-                    else:
-                        raise Exception("Error while sending http request: {0}".format(e))
-            else:
-                s = Session()
-                try:
-                    self.result = WMSTestResult(r, s.send(r, verify=False))
-                    s.close()
-                except Exception as e:
-                    if e.__str__().__contains__("busy"):
-                        if verbosity: print("Pausing the request sending for 5 sec due to a connection overflow.")
-                        sleep(5)
-                        self.result = WMSTestResult(r, s.send(r, verify=False))
-                    else:
-                        raise Exception("Error while sending http request: {0}".format(e))
-    
-    def getResult(self):
-        """Returns the test result of the last test execution."""
-        return self.result
+            try:
+                if not session or not isinstance(session, Session):
+                    self.result = WMSTestResult(r, session.send(r, verify=False))
+                else:
+                    session = Session()
+                    self.result = WMSTestResult(r, session.send(r, verify=False))
+                    session.close()
+            except Exception as e:
+                if e.__str__().__contains__("busy"):
+                    if verbosity: print("Pausing the request sending for 5 sec due to a connection overflow.")
+                    sleep(5)
+                    self.result = WMSTestResult(r, session.send(r, verify=False))
+                else:
+                    raise Exception("Error while sending http request: {0}".format(e))
 
     def getCSV(self):
         """Generates a CSV representation of the test result."""
@@ -417,7 +418,46 @@ class ZoomingBoxWMSTest(RandomBoundingBoxWMSTest):
                 self.boundingbox.zoom(-step)
                 raise Exception("The given step zooms the box out of the spatial extent: " + step)
         return self
-        
+
+
+class WMSTestThread(Thread):
+    """Encapsulates a WMSTest in a separate Thread."""
+    
+    test = None
+    threadpool = None
+    testscompleted = None
+    dry = False
+    verbosity = 0
+    session = None
+    keepalive = True
+    
+    def __init__(self, test, threadpool, testscompleted, dry = False, verbosity=0, session=None, keepalive=True):
+        """Initializes the Thread with a WMSTest test and a Semaphore threadpool. The given test can be executed with the specified additional parameters dry (default = False), verbosity (default = 0) and session. Moreover, the parameter keepalive can be set to False (default = True) in order to close a given session after the test."""
+        Thread.__init__(self)
+        if not isinstance(test, WMSTest):
+            raise Exception("The given test must be an instance of WMSTest.")
+        self.test = test
+        if not isinstance(threadpool, Semaphore):
+            raise Exception("The given threadpool must be an instance of Semaphore.")
+        self.threadpool = threadpool
+        if not isinstance(testscompleted, SimpleQueue):
+            raise Exception("The given testscompleted must be an instance of SimpleQueue.")
+        self.testscompleted = testscompleted
+        self.dry = dry
+        self.verbosity = verbosity
+        self.session = session
+        self.keepalive = keepalive
+    
+    def run(self):
+        """Executes the test."""
+        try:
+            self.test.execute(self.dry, self.verbosity, self.session)
+        except Exception as e:
+            print(e.__str__())
+        if not self.keepalive:
+            self.session.close()
+        self.testscompleted.put(self.test)
+        self.threadpool.release()
 
 #
 # Global definitions
@@ -448,6 +488,7 @@ def main():
     parser.add_argument("layers", nargs='+', help="list of layer names to be tested against each other")
     parser.add_argument("--tests", nargs='+', default=TEST_CLASSES[0], choices=TEST_CLASSES)
     parser.add_argument("--count", type=int, default=1, help="positive number of test repetitions")
+    parser.add_argument("--threads", type=int, default=1, help="positive number of simultaneous tests")
 
     iot = IOTools()
     
@@ -460,6 +501,7 @@ def main():
     layers = args.layers
     testclasses = args.tests
     count = args.count if args.count > 0 else 1
+    threadpool = Semaphore(args.threads) if args.threads > 0 else Semaphore()
 
     if verbosity: print("Initizing tests... ", end = '')
     wmsserver = WMSServer(args.host, args.port, args.path)
@@ -498,27 +540,33 @@ def main():
             iot.progress()
     connectioncount = 0
     session = Session()
+    testscompleted = SimpleQueue()
+    # startingtime = int(time())
     for i in range(tests.__len__()):
         for j in range(tests[i].__len__()):
             if args.outputformat == "bboxes":
                 iot.outputLine(tests[i][j][0].boundingbox.__str__())
             else:
                 for t in tests[i][j]:
-                    t.execute(args.dry, verbosity, session)
-                    connectioncount += 1
-                    if connectioncount == MAX_CONNECTIONS:
-                        if verbosity:
-                            print()
-                            print("Reached " + str(connectioncount) + " connections. Renewing TCP connection.")
-                        session.close()
-                        session = Session()
-                        connectioncount = 0
-                    if args.outputformat == "csv":
-                        iot.outputCSVLine([t.id, t.layers, t.getResult().getCSV()])
-                    else:
-                        iot.outputLine(t.id + "(" + t.layers + " + " + t.boundingbox.__str__() + ")" + ("" if args.dry else ": " + str(t.getResult().response.elapsed.total_seconds()) + " sec"))
-                    t.getResult().close()
-                    if verbosity and not args.dry: iot.progress()
+                    # start test in a thread
+                    if threadpool.acquire():
+                        connectioncount += 1
+                        WMSTestThread(t, threadpool, testscompleted, args.dry, verbosity, session, connectioncount == MAX_CONNECTIONS).start()
+                        if connectioncount == MAX_CONNECTIONS:
+                            if verbosity:
+                                print()
+                                print("Reached " + str(connectioncount) + " connections. Renewing TCP connection.")
+                            session = Session()
+                            connectioncount = 0
+                    # evaluate intermediate results
+                    while not testscompleted.empty():
+                        iot.outputTest(testscompleted.get(), args.outputformat)
+                        if verbosity and not args.dry: iot.progress()
+    # evaluate remaining results
+    while active_count() > 1 or not testscompleted.empty():
+        iot.outputTest(testscompleted.get(), args.outputformat)
+        if verbosity and not args.dry: iot.progress()
+        sleep(1)
     if verbosity and not args.dry: print()
     iot.close()
     if verbosity: print("done.")
